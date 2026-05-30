@@ -1,0 +1,6 @@
+selenium
+requests
+Pillow
+img2pdf
+webdriver-manager
+PyYAML
