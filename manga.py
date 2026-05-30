@@ -1,5 +1,5 @@
 """
-up-manga.com — Download all chapters & save each as a PDF
+Download all chapters & save each as a PDF
 Output: EP1-ตอนที่-1.pdf, EP2-ตอนที่-2.pdf, ...
 
 Usage:
