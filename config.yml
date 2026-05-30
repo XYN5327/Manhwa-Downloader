@@ -1,0 +1,58 @@
+# ─────────────────────────────────────────────
+# Manga Downloader Config
+# ─────────────────────────────────────────────
+
+manga:
+  # URL of the manga's main page (not a chapter page)
+  url: "https://speed-manga.net/manga/mercenary-enrollment/"
+
+  # Chapter range — use null for open-ended
+  # Examples:
+  #   start: 1,  end: null   ->  download everything
+  #   start: 62, end: null   ->  EP62 to the last episode
+  #   start: 10, end: 20     ->  EP10 to EP20 (inclusive)
+  #   start: null, end: 30   ->  EP1 to EP30
+  chapter_start: null
+  chapter_end: null
+
+output:
+  # Folder where PDFs will be saved
+  dir: "Mercenary Enrollment"
+
+  # Set to true to also keep the raw downloaded images per chapter
+  keep_images: false
+
+  # ── Image optimisation ─────────────────────
+  # JPEG quality for saved pages.
+  # 75 = great readability, ~40–55% smaller than original (recommended)
+  # 85 = near-lossless visually, ~20–30% smaller
+  # 60 = maximum compression, some visible softening on detailed panels
+  jpeg_quality: 75
+
+  # Maximum image width in pixels (height is scaled proportionally).
+  # Manhwa is typically 800–1200 px wide. 1600 keeps full sharpness
+  # on any screen. Set to 1200 to shrink further. Use 0 to disable.
+  max_image_width: 1600
+
+browser:
+  # true = run Chrome in the background (no window)
+  headless: true
+
+  # Restart Chrome every N chapters to free memory (recommended: 10)
+  restart_every: 10
+
+speed:
+  # Number of images to download in parallel per chapter
+  # 5  = safe default, unlikely to get rate-limited
+  # 10 = faster, fine for most sites
+  # 20 = maximum speed, may get throttled on slow servers
+  download_workers: 5
+
+  # Seconds to wait between scroll steps (increase if images miss)
+  scroll_wait: 1.5
+
+  # Seconds to wait after page load before scraping images
+  page_wait: 4.0
+
+  # Seconds to wait between chapters (be polite to the server)
+  chapter_delay: 2.0
