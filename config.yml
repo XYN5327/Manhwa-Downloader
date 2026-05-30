@@ -4,7 +4,7 @@
 
 manga:
   # URL of the manga's main page (not a chapter page)
-  url: "https://speed-manga.net/manga/mercenary-enrollment/"
+  url: "URL-HERE"
 
   # Chapter range — use null for open-ended
   # Examples:
@@ -17,7 +17,7 @@ manga:
 
 output:
   # Folder where PDFs will be saved
-  dir: "Mercenary Enrollment"
+  dir: "Manga-Download"
 
   # Set to true to also keep the raw downloaded images per chapter
   keep_images: false
