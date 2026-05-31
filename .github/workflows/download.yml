@@ -1,0 +1,74 @@
+name: Download Manhwa
+
+on:
+  workflow_dispatch:
+    inputs:
+      manga_url:
+        description: 'Manga URL'
+        required: true
+      chapter_start:
+        description: 'Start chapter (leave empty for beginning)'
+        required: false
+      chapter_end:
+        description: 'End chapter (leave empty for latest)'
+        required: false
+      output_dir:
+        description: 'Output folder name'
+        required: true
+        default: 'output'
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser chromium-chromedriver
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Update config.yml
+        run: |
+          python - <<'EOF'
+          import yaml, os
+
+          with open("config.yml") as f:
+              cfg = yaml.safe_load(f)
+
+          cfg["manga"]["url"] = os.environ["MANGA_URL"]
+          cfg["output"]["dir"] = os.environ["OUTPUT_DIR"]
+
+          start = os.environ.get("CHAPTER_START", "").strip()
+          end = os.environ.get("CHAPTER_END", "").strip()
+          cfg["manga"]["chapter_start"] = int(start) if start else None
+          cfg["manga"]["chapter_end"] = int(end) if end else None
+
+          with open("config.yml", "w") as f:
+              yaml.dump(cfg, f)
+          EOF
+        env:
+          MANGA_URL: ${{ github.event.inputs.manga_url }}
+          OUTPUT_DIR: ${{ github.event.inputs.output_dir }}
+          CHAPTER_START: ${{ github.event.inputs.chapter_start }}
+          CHAPTER_END: ${{ github.event.inputs.chapter_end }}
+
+      - name: Run downloader
+        run: python manga.py
+
+      - name: Upload PDFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.output_dir }}
+          path: ${{ github.event.inputs.output_dir }}/
+          retention-days: 7
