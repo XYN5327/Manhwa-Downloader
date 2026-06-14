@@ -25,15 +25,15 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4        # ✅ fixed
 
       - name: Install Chrome
         run: |
           sudo apt-get update
-          sudo apt-get install -y chromium-browser chromium-chromedriver
+          sudo apt-get install -y chromium-browser
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5    # ✅ fixed
         with:
           python-version: '3.11'
 
@@ -44,18 +44,14 @@ jobs:
         run: |
           python - <<'EOF'
           import yaml, os
-
           with open("config.yml") as f:
               cfg = yaml.safe_load(f)
-
           cfg["manga"]["url"] = os.environ["MANGA_URL"]
           cfg["output"]["dir"] = os.environ["OUTPUT_DIR"]
-
           start = os.environ.get("CHAPTER_START", "").strip()
           end = os.environ.get("CHAPTER_END", "").strip()
           cfg["manga"]["chapter_start"] = int(start) if start else None
           cfg["manga"]["chapter_end"] = int(end) if end else None
-
           with open("config.yml", "w") as f:
               yaml.dump(cfg, f)
           EOF
