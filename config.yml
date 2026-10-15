@@ -15,44 +15,91 @@ manga:
   chapter_start: null
   chapter_end: null
 
+  # Referer header sent when downloading images.
+  # null = automatic (the manga site's own address). Only set this if the
+  # images are blocked (403) and you know the site that must be the referer.
+  referer: null
+
 output:
-  # Folder where PDFs will be saved
+  # Folder where the CBZ files will be saved
   dir: "Manga-Download"
 
-  # Set to true to also keep the raw downloaded images per chapter
+  # true = also keep the final page images in a "<chapter>_pages" folder
   keep_images: false
 
-  # ── Image optimisation ─────────────────────
-  # JPEG quality for saved pages.
-  # 75 = great readability, ~40–55% smaller than original (recommended)
-  # 85 = near-lossless visually, ~20–30% smaller
-  # 60 = maximum compression, some visible softening on detailed panels
-  jpeg_quality: 75
+  # Write ComicInfo.xml (series / title / chapter number) into each CBZ.
+  # Komga, Kavita, Mihon, etc. use it for nice names and ordering.
+  comicinfo: true
 
-  # Maximum image width in pixels (height is scaled proportionally).
-  # Manhwa is typically 800–1200 px wide. 1600 keeps full sharpness
-  # on any screen. Set to 1200 to shrink further. Use 0 to disable.
-  max_image_width: 1600
+  # ── Image format inside the CBZ ────────────
+  #   webp     = smallest files (recommended). JPEG pages are re-encoded to
+  #              WebP at `quality`; PNG pages become LOSSLESS WebP.
+  #              A page is only replaced if the result is actually smaller.
+  #   original = no re-encoding at all. Pixel-perfect, fastest, biggest.
+  #   jpeg     = re-encode to JPEG (use only if your reader lacks WebP support)
+  image_format: webp
+
+  # Quality for lossy pages (webp / jpeg), 1-100.
+  #   90 = visually identical to the source, good savings (recommended)
+  #   85 = ~15% smaller again, still clean
+  #   75 = smallest, slight softening on fine line-art / text
+  quality: 90
+
+  # WebP encoder effort, 0-6. 6 = slowest but smallest. Lower it (e.g. 4)
+  # only if conversion is your bottleneck on a weak CPU.
+  webp_method: 4
+
+  # Maximum page width in pixels. 0 = never resize (best quality, default).
+  # Resizing is lossy; set e.g. 1200 only if you want much smaller files.
+  max_image_width: 0
 
 browser:
-  # true = run Chrome in the background (no window)
+  # Which browser to drive: "chrome" or "edge".
+  # Windows already includes Microsoft Edge, so "edge" needs nothing installed.
+  type: edge
+
+  # OPTIONAL: full path to the browser program, for portable/scoop installs.
+  # null = auto-detect. Example (scoop Chromium):
+  #   binary_path: 'C:\Users\YOU\scoop\apps\chromium\current\chrome.exe'
+  binary_path: null
+
+  # OPTIONAL: full path to a driver you installed yourself (chromedriver.exe
+  # or msedgedriver.exe). Must match the browser's major version.
+  # null = Selenium downloads the right driver automatically.
+  driver_path: null
+
+  # true = run the browser in the background (no window)
   headless: true
 
-  # Restart Chrome every N chapters to free memory (recommended: 10)
-  restart_every: 10
+  # Chrome only collects image URLs; the downloader fetches the images
+  # itself. Blocking images in Chrome makes page loads much faster.
+  # If a site shows no images with this on, the script automatically
+  # retries with it off — or set this to false.
+  block_images: true
+
+  # Restart Chrome every N chapters to free memory (0 = never)
+  restart_every: 25
 
 speed:
-  # Number of images to download in parallel per chapter
-  # 5  = safe default, unlikely to get rate-limited
-  # 10 = faster, fine for most sites
-  # 20 = maximum speed, may get throttled on slow servers
-  download_workers: 5
+  # Images downloaded in parallel (shared by all chapters in flight)
+  #   8  = gentle      16 = default      32 = fast connection, tolerant site
+  download_workers: 16
 
-  # Seconds to wait between scroll steps (increase if images miss)
-  scroll_wait: 1.5
+  # Chapters downloaded/converted at the same time while Chrome is already
+  # collecting the next one. 2-4 is the sweet spot.
+  parallel_chapters: 3
 
-  # Seconds to wait after page load before scraping images
-  page_wait: 4.0
+  # CPU processes used for WebP/JPEG conversion.
+  # 0 = automatic (CPU threads minus 2)
+  convert_workers: 0
+
+  # Max seconds to wait for a chapter's images to appear (polls; doesn't
+  # always wait the full time)
+  page_wait: 3.0
+
+  # Seconds to wait between scroll steps, only needed for lazy-loaded pages.
+  # Increase if some pages are missing.
+  scroll_wait: 0.4
 
   # Seconds to wait between chapters (be polite to the server)
-  chapter_delay: 2.0
+  chapter_delay: 0.5
