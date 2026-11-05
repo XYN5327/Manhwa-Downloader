@@ -136,6 +136,32 @@ def make_driver(headless: bool, block_images: bool):
 # Helpers
 # ─────────────────────────────────────────────
 
+PRIORITIES = ("normal", "low", "idle")
+
+
+def set_priority(level: str):
+    """
+    Lower this process's CPU priority so a game (or anything else) always
+    wins. "idle" = only use CPU time nobody else wants. Child processes
+    (conversion workers, Chrome) inherit it.
+    """
+    if level == "normal":
+        return
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            k32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            below_normal, idle = 0x00004000, 0x00000040
+            k32.SetPriorityClass(k32.GetCurrentProcess(),
+                                 below_normal if level == "low" else idle)
+        else:
+            os.nice(10 if level == "low" else 19)
+    except Exception:
+        pass
+
 def safe_filename(name: str) -> str:
     name = name.split("\n")[0].strip()
     name = re.sub(r'[\\/*?:"<>|\r\t]', "-", name)
@@ -564,6 +590,7 @@ def main():
     block_images  = get(cfg, "browser", "block_images",     default=True)
     dl_workers    = int(get(cfg, "speed", "download_workers", default=16))
     conv_workers  = int(get(cfg, "speed", "convert_workers",  default=0))
+    priority      = str(get(cfg, "speed", "priority",         default="low")).lower()
     chapter_par   = int(get(cfg, "speed", "parallel_chapters", default=3))
     scroll_wait   = float(get(cfg, "speed", "scroll_wait",    default=0.4))
     page_wait     = float(get(cfg, "speed", "page_wait",      default=3.0))
@@ -578,6 +605,9 @@ def main():
     if BROWSER["kind"] not in ("chrome", "edge"):
         print(f"browser.type must be 'chrome' or 'edge', got '{BROWSER['kind']}'")
         sys.exit(1)
+    if priority not in PRIORITIES:
+        print(f"speed.priority must be one of {PRIORITIES}, got '{priority}'")
+        sys.exit(1)
     if conv_workers <= 0:
         conv_workers = max(1, (os.cpu_count() or 4) - 2)
     needs_conversion = image_format != "original"
@@ -588,6 +618,10 @@ def main():
     print(f"Downloads: {dl_workers} parallel | chapters in flight: {chapter_par}"
           + (f" | convert processes: {conv_workers}" if needs_conversion else ""))
 
+    set_priority(priority)      # do this before any workers/Chrome are started
+    if priority != "normal":
+        print(f"CPU priority: {priority}")
+
     os.makedirs(output_dir, exist_ok=True)
     for leftover in glob.glob(os.path.join(output_dir, "*.part")):
         os.remove(leftover)             # unfinished files from a crashed run
@@ -595,7 +629,8 @@ def main():
     S = SimpleNamespace(
         session=make_session(manga_url, referer, dl_workers),
         dl_pool=ThreadPoolExecutor(max_workers=dl_workers),
-        conv_pool=ProcessPoolExecutor(max_workers=conv_workers) if needs_conversion else None,
+        conv_pool=(ProcessPoolExecutor(max_workers=conv_workers, initializer=set_priority,
+                             initargs=(priority,)) if needs_conversion else None),
         mode=image_format, quality=quality, method=webp_method, max_width=max_width,
         comicinfo=comicinfo, keep_images=keep_images, series="Manhwa",
     )
