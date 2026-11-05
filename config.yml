@@ -47,7 +47,7 @@ output:
 
   # WebP encoder effort, 0-6. 6 = slowest but smallest. Lower it (e.g. 4)
   # only if conversion is your bottleneck on a weak CPU.
-  webp_method: 4
+  webp_method: 6
 
   # Maximum page width in pixels. 0 = never resize (best quality, default).
   # Resizing is lossy; set e.g. 1200 only if you want much smaller files.
@@ -56,7 +56,7 @@ output:
 browser:
   # Which browser to drive: "chrome" or "edge".
   # Windows already includes Microsoft Edge, so "edge" needs nothing installed.
-  type: edge
+  type: chrome
 
   # OPTIONAL: full path to the browser program, for portable/scoop installs.
   # null = auto-detect. Example (scoop Chromium):
@@ -90,8 +90,16 @@ speed:
   parallel_chapters: 3
 
   # CPU processes used for WebP/JPEG conversion.
-  # 0 = automatic (CPU threads minus 2)
-  convert_workers: 0
+  # 0 = automatic (CPU threads minus 2). Fewer = less CPU used, slower.
+  #   e.g. 2-4 while gaming
+  convert_workers: 3
+
+  # CPU priority of the whole downloader (conversion workers and the browser
+  # included), so games and other programs always get the CPU first.
+  #   normal = same as other programs
+  #   low    = below normal (default)
+  #   idle   = only uses CPU time nothing else wants (best while gaming)
+  priority: low
 
   # Max seconds to wait for a chapter's images to appear (polls; doesn't
   # always wait the full time)
