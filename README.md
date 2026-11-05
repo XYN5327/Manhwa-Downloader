@@ -69,6 +69,8 @@ output:
 speed:
   download_workers: 16   # 8 = gentle, 16 = default, 32 = fast connection
   parallel_chapters: 3
+  priority: idle        # only uses CPU time nothing else wants
+  convert_workers: 3    # fewer cores used for re-encoding
 ```
 
 Download speed is limited by your internet connection and the site's server, not your CPU. If you see `429` / failed pages, lower `download_workers` and `parallel_chapters`.
