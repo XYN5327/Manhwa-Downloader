@@ -1,6 +1,5 @@
-selenium
+selenium>=4.6
 requests
-Pillow
-img2pdf
-webdriver-manager
+Pillow>=10
 PyYAML
+webdriver-manager
