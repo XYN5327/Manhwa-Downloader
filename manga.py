@@ -1,493 +1,728 @@
 """
-Simple GUI for manga.py.
+Download all chapters & save each one as a CBZ.
+Output: EP001-ตอนที่ 1.cbz, EP002-ตอนที่ 2.cbz, ...
 
-Edits config.yml (keeping all your comments) and runs the downloader,
-showing its output in a log window.
+Usage:
+    python manga.py              # uses config.yml in the same folder
+    python manga.py my.yml       # uses a custom config file
 
-Keep this file in the same folder as manga.py and config.yml.
-    python manga_gui.py
+How it is fast:
+    * Chrome only collects image URLs (images are blocked in the browser).
+    * While Chrome scrapes chapter N+1, chapter N is already downloading,
+      converting and packing in the background (pipeline).
+    * Images are downloaded in parallel over one reused HTTP session.
+    * Page conversion (WebP/JPEG) runs on all CPU cores.
+    * Nothing touches the disk until the finished CBZ is written.
 """
 
-import multiprocessing
+import gc
+import glob
+import io
 import os
-import queue
 import re
-import subprocess
 import sys
 import threading
-import traceback
-import tkinter as tk
-from collections import namedtuple
-from tkinter import filedialog, messagebox, ttk
-from tkinter import font as tkfont
+import time
+import zipfile
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from types import SimpleNamespace
+from urllib.parse import urljoin, urlparse
+from xml.sax.saxutils import escape
 
+
+import requests
 import yaml
+from PIL import Image
+from requests.adapters import HTTPAdapter
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.edge.service import Service as EdgeService
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from urllib3.util.retry import Retry
 
-import manga
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    USE_WDM = True
+except ImportError:
+    USE_WDM = False
 
-APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
-CONFIG_PATH = os.path.join(APP_DIR, "config.yml")
+# Long webtoon strips are huge; never trip Pillow's decompression-bomb guard.
+Image.MAX_IMAGE_PIXELS = None
 
-# ─────────────────────────────────────────────
-# Field definitions: one row in the form each
-# kinds: text, text? (may be blank -> null), int, int? (blank -> null),
-#        float, bool, choice, dir, file? (blank -> null)
-# ─────────────────────────────────────────────
-
-Field = namedtuple("Field", "section key label kind opts hint default")
-
-FIELDS = [
-    Field("manga", "url", "Manga page URL", "text", None,
-          "The manga's main page, not a chapter page.", ""),
-    Field("manga", "chapter_start", "First chapter", "int?", (1, 100000),
-          "Leave blank to start from chapter 1.", None),
-    Field("manga", "chapter_end", "Last chapter", "int?", (1, 100000),
-          "Leave blank to download up to the latest chapter.", None),
-    Field("manga", "referer", "Referer", "text?", None,
-          "Leave blank unless images fail with 403 errors.", None),
-
-    Field("output", "dir", "Save folder", "dir", None,
-          "A relative folder is created next to the app.", "Manga-Download"),
-    Field("output", "image_format", "Image format", "choice",
-          ("webp", "original", "jpeg"),
-          "webp = smallest files. original = untouched pages. jpeg = for readers without WebP.",
-          "webp"),
-    Field("output", "quality", "Quality", "int", (1, 100),
-          "For webp and jpeg. 90 looks identical to the source; 75 is smallest.", 90),
-    Field("output", "webp_method", "WebP effort", "int", (0, 6),
-          "6 = smallest files but slowest. Lower it on a weak CPU.", 6),
-    Field("output", "max_image_width", "Max page width (px)", "int", (0, 20000),
-          "0 = never resize. Resizing loses quality.", 0),
-    Field("output", "comicinfo", "Write ComicInfo.xml", "bool", None,
-          "Series and chapter info for Komga, Kavita, Mihon and similar apps.", True),
-    Field("output", "keep_images", "Keep page images", "bool", None,
-          "Also save the pages in a folder next to each CBZ.", False),
-
-    Field("browser", "type", "Browser", "choice", ("chrome", "edge"),
-          "Edge is already included with Windows.", "chrome"),
-    Field("browser", "binary_path", "Browser program", "file?", None,
-          "Only for portable installs. Blank = detect automatically.", None),
-    Field("browser", "driver_path", "Driver program", "file?", None,
-          "chromedriver.exe or msedgedriver.exe. Blank = downloaded automatically.", None),
-    Field("browser", "headless", "Run browser without a window", "bool", None,
-          "The browser works in the background.", True),
-    Field("browser", "block_images", "Block images in the browser", "bool", None,
-          "Faster. Turns itself off if a site shows no images.", True),
-    Field("browser", "restart_every", "Restart browser every N chapters", "int", (0, 10000),
-          "Frees memory. 0 = never.", 25),
-
-    Field("speed", "download_workers", "Parallel downloads", "int", (1, 64),
-          "8 = gentle, 16 = default, 32 = fast connection and tolerant site.", 16),
-    Field("speed", "parallel_chapters", "Chapters at once", "int", (1, 8),
-          "2 to 4 works best.", 3),
-    Field("speed", "convert_workers", "Conversion processes", "int", (0, 64),
-          "0 = automatic. Use 2 to 4 while gaming.", 3),
-    Field("speed", "priority", "CPU priority", "choice", ("normal", "low", "idle"),
-          "idle = only uses CPU time nothing else wants. Best while gaming.", "low"),
-    Field("speed", "page_wait", "Page wait (seconds)", "float", (0, 60),
-          "Longest wait for a chapter's images to appear.", 3.0),
-    Field("speed", "scroll_wait", "Scroll wait (seconds)", "float", (0, 10),
-          "Increase if some pages are missing.", 0.4),
-    Field("speed", "chapter_delay", "Delay between chapters (seconds)", "float", (0, 30),
-          "Be polite to the server.", 0.5),
-]
-
-TABS = {"manga": "Manga", "output": "Output", "browser": "Browser", "speed": "Speed"}
-FIELD_BY_KEY = {(f.section, f.key): f for f in FIELDS}
+WEBP_MAX_DIM = 16383    # hard limit of the WebP format
+JPEG_MAX_DIM = 65500    # hard limit of the JPEG format
+IMAGE_MODES = ("original", "webp", "jpeg")
 
 
 # ─────────────────────────────────────────────
-# Reading values from the form / writing config.yml
+# Config
 # ─────────────────────────────────────────────
 
-def read_field(f: Field, raw):
-    """Convert what the user typed into a Python value. Raises ValueError."""
-    if f.kind == "bool":
-        return bool(raw)
-    s = str(raw).strip()
+def load_config(path: str = "config.yml") -> dict:
+    if not os.path.exists(path):
+        print(f"Config file not found: {path}")
+        sys.exit(1)
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
-    if f.kind in ("text?", "file?"):
-        return s or None
-    if f.kind in ("text", "dir"):
-        if not s:
-            raise ValueError(f"{f.label} can't be empty.")
-        return s
-    if f.kind == "choice":
-        if s not in f.opts:
-            raise ValueError(f"{f.label} must be one of: {', '.join(f.opts)}.")
-        return s
 
-    if f.kind == "int?" and not s:
-        return None
-    cast = float if f.kind == "float" else int
+def get(cfg: dict, *keys, default=None):
+    val = cfg
+    for k in keys:
+        if not isinstance(val, dict):
+            return default
+        val = val.get(k)
+    return default if val is None else val
+
+
+# ─────────────────────────────────────────────
+# Driver
+# ─────────────────────────────────────────────
+
+# Set from config in main(): which browser to drive and where it lives.
+BROWSER = {"kind": "chrome", "binary": None, "driver": None}
+
+
+def make_driver(headless: bool, block_images: bool):
+    kind = BROWSER["kind"]
+    options = EdgeOptions() if kind == "edge" else Options()
+    if BROWSER["binary"]:
+        options.binary_location = BROWSER["binary"]
+    if headless:
+        options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1280,900")
+    options.add_argument("--js-flags=--max-old-space-size=512")
+    options.add_argument("--renderer-process-limit=1")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-sync")
+    options.add_argument("--disable-translate")
+    options.add_argument("--disk-cache-size=33554432")
+    options.add_argument("--media-cache-size=33554432")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+    )
+    # Return as soon as the DOM is ready instead of waiting for every asset.
+    options.page_load_strategy = "eager"
+    if block_images:
+        # We download the images ourselves, so the browser doesn't need to.
+        options.add_argument("--blink-settings=imagesEnabled=false")
+
+    driver_cls = webdriver.Edge if kind == "edge" else webdriver.Chrome
+    service_cls = EdgeService if kind == "edge" else Service
+
+    if BROWSER["driver"]:
+        # Use the driver you installed yourself (e.g. from scoop).
+        return driver_cls(service=service_cls(BROWSER["driver"]), options=options)
     try:
-        num = cast(s)
-    except ValueError:
-        kind = "a number" if cast is float else "a whole number"
-        raise ValueError(f"{f.label} must be {kind}.")
-    if f.opts and not (f.opts[0] <= num <= f.opts[1]):
-        raise ValueError(f"{f.label} must be between {f.opts[0]} and {f.opts[1]}.")
-    return num
-
-
-def fmt_value(f: Field, v) -> str:
-    """Format a value as YAML text for config.yml."""
-    if v is None:
-        return "null"
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, (int, float)):
-        return repr(v)
-    if f.kind == "choice":
-        return v
-    if "\\" in v:      # Windows paths: single quotes, no escaping needed
-        return "'" + v.replace("'", "''") + "'"
-    return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-_TOP = re.compile(r"^([A-Za-z_]\w*):\s*(#.*)?$")
-_KEY = re.compile(r"^(\s+)([A-Za-z_]\w*):.*$")
-
-
-def patch_config(text: str, values: dict) -> str:
-    """
-    Replace values line by line so every comment in config.yml survives.
-    values maps (section, key) -> already formatted YAML text.
-    Keys missing from the file are added under their section.
-    """
-    lines = text.splitlines()
-    pending = dict(values)
-    section = None
-
-    for i, line in enumerate(lines):
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        m = _TOP.match(line)
-        if m:
-            section = m.group(1)
-            continue
-        m = _KEY.match(line)
-        if m and section and (section, m.group(2)) in pending:
-            key = (section, m.group(2))
-            lines[i] = f"{m.group(1)}{m.group(2)}: {pending.pop(key)}"
-
-    for (sec, key), val in pending.items():
-        idx = next((i for i, l in enumerate(lines)
-                    if re.match(rf"^{re.escape(sec)}:\s*(#.*)?$", l)), None)
-        if idx is None:
-            if lines and lines[-1].strip():
-                lines.append("")
-            lines.append(f"{sec}:")
-            idx = len(lines) - 1
-        lines.insert(idx + 1, f"  {key}: {val}")
-
-    return "\n".join(lines) + "\n"
+        # Selenium Manager (built into selenium >= 4.6) finds/downloads the driver.
+        return driver_cls(options=options)
+    except Exception as e:
+        if kind != "chrome" or not USE_WDM:
+            raise
+        print(f"Selenium Manager failed ({type(e).__name__}); trying webdriver-manager...")
+        service = Service(ChromeDriverManager().install())
+        return webdriver.Chrome(service=service, options=options)
 
 
 # ─────────────────────────────────────────────
-# Log plumbing: manga.py prints, we show it in the window
+# Helpers
 # ─────────────────────────────────────────────
 
-class QueueWriter:
-    def __init__(self, q: queue.Queue):
-        self.q = q
+PRIORITIES = ("normal", "low", "idle")
 
-    def write(self, s):
-        if s:
-            self.q.put(s)
-        return len(s) if s else 0
 
-    def flush(self):
+def set_priority(level: str):
+    """
+    Lower this process's CPU priority so a game (or anything else) always
+    wins. "idle" = only use CPU time nobody else wants. Child processes
+    (conversion workers, Chrome) inherit it.
+    """
+    if level == "normal":
+        return
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            k32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            below_normal, idle = 0x00004000, 0x00000040
+            k32.SetPriorityClass(k32.GetCurrentProcess(),
+                                 below_normal if level == "low" else idle)
+        else:
+            os.nice(10 if level == "low" else 19)
+    except Exception:
         pass
 
-    def isatty(self):
-        return False
+def safe_filename(name: str) -> str:
+    name = name.split("\n")[0].strip()
+    name = re.sub(r'[\\/*?:"<>|\r\t]', "-", name)
+    name = re.sub(r'-+', "-", name)
+    name = re.sub(r'\s+', " ", name)
+    return name.strip(" -")
+
+
+def human_size(n: float) -> str:
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
+def sniff_ext(data: bytes):
+    """Identify an image by its magic bytes. Returns None if not an image."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[4:12] in (b"ftypavif", b"ftypavis"):
+        return "avif"
+    return None
 
 
 # ─────────────────────────────────────────────
-# The window
+# Scraping (Selenium only collects URLs)
 # ─────────────────────────────────────────────
 
-class App(ttk.Frame):
-    def __init__(self, root: tk.Tk):
-        super().__init__(root, padding=12)
-        self.root = root
-        self.vars = {}
-        self.rows = {sec: 0 for sec in TABS}
-        self.q = queue.Queue()
-        self.running = False
+CHAPTER_SELECTORS = [
+    ".eplister ul li a",
+    ".wp-manga-chapter a",
+    ".chapter-link",
+    "li.wp-manga-chapter a",
+]
 
-        hint_font = tkfont.nametofont("TkDefaultFont").copy()
-        hint_font.configure(size=max(8, hint_font.cget("size") - 1))
-        ttk.Style().configure("Hint.TLabel", foreground="#6b6b6b", font=hint_font)
+IMG_SELECTORS = ["#readerarea img", ".reading-content img", "img[data-src]"]
 
-        self.build()
-        self.load()
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.after(100, self.poll)
+# One round-trip for the whole list instead of one WebDriver call per element.
+JS_LINKS = (
+    "return Array.from(document.querySelectorAll(arguments[0]))"
+    ".map(e => [e.href, (e.innerText || e.textContent || '').trim()]);"
+)
 
-    # ---- layout ----
+JS_COLLECT = """
+const sels = arguments[0];
+for (const s of sels) {
+  const els = document.querySelectorAll(s);
+  if (els.length) {
+    return Array.from(els).map(e => [
+      e.getAttribute('data-src') || e.getAttribute('data-lazy-src')
+        || e.getAttribute('data-original') || '',
+      e.getAttribute('src') || ''
+    ]);
+  }
+}
+return [];
+"""
 
-    def build(self):
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
 
-        nb = ttk.Notebook(self)
-        nb.grid(row=0, column=0, sticky="ew")
-        frames = {}
-        for sec, title in TABS.items():
-            fr = ttk.Frame(nb, padding=(14, 6, 14, 14))
-            fr.columnconfigure(1, weight=1)
-            nb.add(fr, text=title)
-            frames[sec] = fr
-        for f in FIELDS:
-            self.add_field(frames[f.section], f)
+def _wait_any(driver, selectors: list, timeout: float):
+    css = ", ".join(selectors)
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, css))
+        )
+    except Exception:
+        pass
 
-        bar = ttk.Frame(self)
-        bar.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        self.btn_download = ttk.Button(bar, text="Save and download", command=self.on_download)
-        self.btn_download.pack(side="left")
-        self.btn_save = ttk.Button(bar, text="Save settings", command=self.on_save)
-        self.btn_save.pack(side="left", padx=6)
-        ttk.Button(bar, text="Open save folder", command=self.open_output).pack(side="left")
-        self.status = tk.StringVar(value="")
-        ttk.Label(bar, textvariable=self.status, style="Hint.TLabel").pack(side="right")
 
-        self.progress = ttk.Progressbar(self, mode="indeterminate")
-        self.progress.grid(row=2, column=0, sticky="ew", pady=(10, 6))
+def get_series_title(driver) -> str:
+    for sel in ("h1.entry-title", "h1.post-title", "h1"):
+        els = driver.find_elements(By.CSS_SELECTOR, sel)
+        if els and els[0].text.strip():
+            return safe_filename(els[0].text)
+    return safe_filename(driver.title.split(" - ")[0]) or "Manhwa"
 
-        box = ttk.Frame(self)
-        box.grid(row=3, column=0, sticky="nsew")
-        box.columnconfigure(0, weight=1)
-        box.rowconfigure(0, weight=1)
-        self.log = tk.Text(box, height=12, wrap="word", state="disabled",
-                           font=("Consolas", 9), relief="solid", borderwidth=1)
-        scroll = ttk.Scrollbar(box, command=self.log.yview)
-        self.log.configure(yscrollcommand=scroll.set)
-        self.log.grid(row=0, column=0, sticky="nsew")
-        scroll.grid(row=0, column=1, sticky="ns")
 
-    def add_field(self, fr: ttk.Frame, f: Field):
-        r = self.rows[f.section]
-        self.rows[f.section] += 2
-        key = (f.section, f.key)
+def get_chapter_links(driver, manga_url: str) -> tuple:
+    print(f"\nFetching chapter list from: {manga_url}")
+    driver.get(manga_url)
+    _wait_any(driver, CHAPTER_SELECTORS, 10)
 
-        if f.kind == "bool":
-            var = tk.BooleanVar()
-            ttk.Checkbutton(fr, text=f.label, variable=var).grid(
-                row=r, column=0, columnspan=3, sticky="w", pady=(10, 0))
-            ttk.Label(fr, text=f.hint, style="Hint.TLabel").grid(
-                row=r + 1, column=0, columnspan=3, sticky="w", padx=(24, 0))
-        else:
-            var = tk.StringVar()
-            ttk.Label(fr, text=f.label).grid(
-                row=r, column=0, sticky="w", padx=(0, 14), pady=(10, 0))
-            if f.kind == "choice":
-                w = ttk.Combobox(fr, textvariable=var, values=f.opts,
-                                 state="readonly", width=12)
-                sticky = "w"
-            elif f.kind in ("int", "float"):
-                step = 0.1 if f.kind == "float" else 1
-                w = ttk.Spinbox(fr, textvariable=var, from_=f.opts[0], to=f.opts[1],
-                                increment=step, width=10)
-                sticky = "w"
-            elif f.kind == "int?":
-                w = ttk.Entry(fr, textvariable=var, width=12)
-                sticky = "w"
+    links = []
+    for sel in CHAPTER_SELECTORS:
+        rows = driver.execute_script(JS_LINKS, sel)
+        if rows:
+            links = [(href, text) for href, text in rows]
+            break
+
+    if not links:
+        print("Could not find chapter links automatically.")
+        print("Open the manga page, inspect a chapter link, and update CHAPTER_SELECTORS.")
+        return [], ""
+
+    links = [(url, title) for url, title in reversed(links) if url]
+    series = get_series_title(driver)
+    print(f"Found {len(links)} chapters of: {series}")
+    return links, series
+
+
+def collect_srcs(driver, base_url: str) -> tuple:
+    """
+    Read every <img> URL in one browser call.
+    Returns (urls, pending); pending=True means some images still have a
+    placeholder (lazy loading) and the page needs more scrolling.
+    """
+    rows = driver.execute_script(JS_COLLECT, IMG_SELECTORS)
+    srcs, pending = [], False
+    for lazy, src in rows:
+        cand = lazy or src
+        if not cand or cand.startswith("data:"):
+            pending = True
+            continue
+        cand = urljoin(base_url, cand)
+        low = cand.lower()
+        if cand.startswith("http") and ".svg" not in low and "logo" not in low:
+            srcs.append(cand)
+    return srcs, pending
+
+
+def _settle(driver, base_url: str, max_wait: float) -> tuple:
+    """Poll until the image list stops changing (instead of a fixed sleep)."""
+    deadline = time.time() + max_wait
+    last, srcs, pending = -1, [], True
+    while time.time() < deadline:
+        srcs, pending = collect_srcs(driver, base_url)
+        if srcs and not pending and len(srcs) == last:
+            break
+        last = len(srcs)
+        time.sleep(0.25)
+    return srcs, pending
+
+
+def _scroll_fully(driver, base_url: str, scroll_wait: float) -> list:
+    """Slow path: scroll viewport by viewport until nothing new appears."""
+    pos, stable, last_count = 0, 0, -1
+    for _ in range(400):
+        height = driver.execute_script("return document.body.scrollHeight")
+        view = driver.execute_script("return window.innerHeight")
+        pos = min(pos + view, height)
+        driver.execute_script("window.scrollTo(0, arguments[0]);", pos)
+        time.sleep(scroll_wait)
+        if pos >= height:
+            srcs, pending = collect_srcs(driver, base_url)
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            if new_height == height and not pending and len(srcs) == last_count:
+                stable += 1
             else:
-                w = ttk.Entry(fr, textvariable=var)
-                sticky = "ew"
-            w.grid(row=r, column=1, sticky=sticky, pady=(10, 0))
-            if f.kind in ("dir", "file?"):
-                ttk.Button(fr, text="Browse...", command=lambda f=f, v=var: self.browse(f, v)
-                           ).grid(row=r, column=2, padx=(6, 0), pady=(10, 0))
-            ttk.Label(fr, text=f.hint, style="Hint.TLabel", wraplength=520,
-                      justify="left").grid(row=r + 1, column=1, columnspan=2, sticky="w")
-        self.vars[key] = var
+                stable = 0
+            last_count = len(srcs)
+            if stable >= 2:
+                break
+    driver.execute_script("window.scrollTo(0, 0);")
+    return collect_srcs(driver, base_url)[0]
 
-    def browse(self, f: Field, var: tk.StringVar):
-        start = var.get() or APP_DIR
-        if f.kind == "dir":
-            path = filedialog.askdirectory(initialdir=start if os.path.isdir(start) else APP_DIR)
-        else:
-            path = filedialog.askopenfilename(
-                initialdir=os.path.dirname(start) if os.path.exists(start) else APP_DIR)
-        if path:
-            var.set(os.path.normpath(path))
 
-    # ---- config <-> form ----
+def get_image_srcs(driver, url: str, page_wait: float, scroll_wait: float) -> list:
+    """Load a chapter page and return its image URLs in reading order."""
+    driver.get(url)
+    _wait_any(driver, IMG_SELECTORS, 15)
+    base = driver.current_url
 
-    def load(self):
-        data = {}
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
-                data = yaml.safe_load(fh) or {}
-        except FileNotFoundError:
-            self.status.set("No config.yml yet. It will be created when you save.")
-        except yaml.YAMLError as e:
-            messagebox.showerror("config.yml problem",
-                                 f"config.yml could not be read, so defaults are shown.\n\n{e}")
-        for f in FIELDS:
-            val = manga.get(data, f.section, f.key, default=f.default)
-            var = self.vars[(f.section, f.key)]
-            if f.kind == "bool":
-                var.set(bool(val))
-            else:
-                var.set("" if val is None else str(val))
-        if str(self.vars[("manga", "url")].get()) == "URL-HERE":
-            self.vars[("manga", "url")].set("")
+    srcs, pending = _settle(driver, base, page_wait)
 
-    def collect(self) -> dict:
-        values = {}
-        for f in FIELDS:
-            values[(f.section, f.key)] = read_field(f, self.vars[(f.section, f.key)].get())
-        url = values[("manga", "url")]
-        if not url.lower().startswith(("http://", "https://")):
-            raise ValueError("Manga page URL must start with http:// or https://")
-        first, last = values[("manga", "chapter_start")], values[("manga", "chapter_end")]
-        if first is not None and last is not None and first > last:
-            raise ValueError("First chapter can't be higher than last chapter.")
-        return values
+    # Fast path check: jump to the bottom once. If nothing new shows up and no
+    # placeholders remain, we're done. Otherwise fall back to a full scroll.
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(scroll_wait)
+    more, pending2 = collect_srcs(driver, base)
+    if pending or pending2 or len(more) != len(srcs):
+        srcs = _scroll_fully(driver, base, scroll_wait)
+    else:
+        srcs = more
 
-    def save(self) -> bool:
-        try:
-            values = self.collect()
-        except ValueError as e:
-            messagebox.showwarning("Check your settings", str(e))
-            return False
-        formatted = {k: fmt_value(FIELD_BY_KEY[k], v) for k, v in values.items()}
-        try:
-            try:
-                with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
-                    text = fh.read()
-            except FileNotFoundError:
-                text = ""
-            new_text = patch_config(text, formatted)
-            tmp = CONFIG_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(new_text)
-            os.replace(tmp, CONFIG_PATH)
-        except OSError as e:
-            messagebox.showerror("Could not save", f"config.yml could not be written.\n\n{e}")
-            return False
-        self.status.set("Settings saved.")
-        return True
+    gc.collect()
+    return srcs
 
-    # ---- buttons ----
 
-    def on_save(self):
-        self.save()
+# ─────────────────────────────────────────────
+# Download
+# ─────────────────────────────────────────────
 
-    def on_download(self):
-        if self.save():
-            self.start_download()
+def make_session(manga_url: str, referer, workers: int) -> requests.Session:
+    if not referer:
+        p = urlparse(manga_url)
+        referer = f"{p.scheme}://{p.netloc}/"
+    session = requests.Session()
+    session.headers.update({
+        "Referer": referer,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+        ),
+    })
+    retry = Retry(
+        total=4, backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry, pool_connections=16, pool_maxsize=max(workers, 4)
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
-    def open_output(self):
-        folder = os.path.join(APP_DIR, self.vars[("output", "dir")].get().strip()
-                              or "Manga-Download")
-        os.makedirs(folder, exist_ok=True)
-        try:
-            if os.name == "nt":
-                os.startfile(folder)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", folder])
-            else:
-                subprocess.Popen(["xdg-open", folder])
-        except OSError as e:
-            messagebox.showerror("Could not open folder", str(e))
 
-    # ---- running the downloader ----
+def fetch(session: requests.Session, src: str):
+    """Download one image into memory. Returns bytes, or None on failure."""
+    try:
+        resp = session.get(src, timeout=(10, 30))
+        resp.raise_for_status()
+        data = resp.content
+        if not data:
+            raise ValueError("empty response")
+        if sniff_ext(data) is None:
+            # Unknown signature: only accept it if Pillow can really read it
+            # (catches HTML error pages served with an image Content-Type).
+            Image.open(io.BytesIO(data)).verify()
+        return data
+    except Exception as e:
+        print(f"      Failed ...{src[-60:]}: {e}")
+        return None
 
-    def set_running(self, running: bool):
-        self.running = running
-        state = "disabled" if running else "normal"
-        self.btn_download.configure(state=state)
-        self.btn_save.configure(state=state)
-        if running:
-            self.progress.start(12)
-            self.status.set("Downloading...")
-        else:
-            self.progress.stop()
 
-    def start_download(self):
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
-        self.set_running(True)
-        threading.Thread(target=self.worker, daemon=True).start()
+# ─────────────────────────────────────────────
+# Image conversion (runs in worker processes)
+# ─────────────────────────────────────────────
 
-    def worker(self):
-        old_out, old_err, old_argv = sys.stdout, sys.stderr, sys.argv
-        sys.stdout = sys.stderr = QueueWriter(self.q)
-        sys.argv = [old_argv[0], CONFIG_PATH]
-        code = 0
-        try:
-            manga.main()
-        except SystemExit as e:
-            code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
-        except Exception:
-            traceback.print_exc()
-            code = 1
-        finally:
-            sys.stdout, sys.stderr, sys.argv = old_out, old_err, old_argv
-            self.q.put(("done", code))
+def _flatten(img: Image.Image) -> Image.Image:
+    """Composite transparency onto white (JPEG has no alpha channel)."""
+    rgba = img.convert("RGBA")
+    bg = Image.new("RGB", rgba.size, (255, 255, 255))
+    bg.paste(rgba, mask=rgba.getchannel("A"))
+    return bg
 
-    def poll(self):
-        try:
-            while True:
-                item = self.q.get_nowait()
-                if isinstance(item, tuple):
-                    self.on_finished(item[1])
+
+def convert_page(args: tuple) -> tuple:
+    """
+    Convert one page. Returns (bytes, extension).
+    Never makes a page worse: if conversion fails or isn't smaller, the
+    original bytes are kept untouched.
+    """
+    data, mode, quality, method, max_width = args
+    orig_ext = sniff_ext(data) or "jpg"
+
+    if mode == "original":
+        return data, orig_ext
+
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            if getattr(img, "is_animated", False):
+                return data, orig_ext
+            src_fmt = img.format
+            img.load()
+            icc = img.info.get("icc_profile")
+
+            resized = False
+            if max_width and img.width > max_width:
+                new_h = max(1, round(img.height * max_width / img.width))
+                img = img.resize((max_width, new_h), Image.LANCZOS)
+                resized = True
+
+            out = io.BytesIO()
+            if mode == "webp":
+                if src_fmt == "WEBP" and not resized:
+                    return data, orig_ext
+                if max(img.size) > WEBP_MAX_DIM:
+                    return data, orig_ext
+                if img.mode not in ("RGB", "RGBA"):
+                    has_alpha = img.mode in ("LA", "PA") or "transparency" in img.info
+                    img = img.convert("RGBA" if has_alpha else "RGB")
+                kw = {"format": "WEBP", "method": method}
+                if src_fmt == "JPEG":
+                    kw["quality"] = quality
                 else:
-                    self.append(item)
-        except queue.Empty:
-            pass
-        self.after(100, self.poll)
+                    # PNG/GIF/BMP sources: lossless WebP is much smaller than PNG
+                    kw.update(lossless=True, quality=100)
+                if icc:
+                    kw["icc_profile"] = icc
+                img.save(out, **kw)
+                new_ext = "webp"
+            else:  # jpeg
+                if max(img.size) > JPEG_MAX_DIM:
+                    return data, orig_ext
+                if img.mode not in ("RGB", "L"):
+                    img = _flatten(img)
+                kw = {"format": "JPEG", "quality": quality,
+                      "optimize": True, "progressive": True}
+                if icc:
+                    kw["icc_profile"] = icc
+                img.save(out, **kw)
+                new_ext = "jpg"
 
-    def append(self, text: str):
-        self.log.configure(state="normal")
-        self.log.insert("end", text)
-        self.log.see("end")
-        self.log.configure(state="disabled")
+            new = out.getvalue()
+            if not resized and len(new) >= len(data):
+                return data, orig_ext
+            return new, new_ext
+    except Exception:
+        return data, orig_ext
 
-    def on_finished(self, code: int):
-        self.set_running(False)
-        if code == 0:
-            self.status.set("Finished.")
+
+# ─────────────────────────────────────────────
+# CBZ creation
+# ─────────────────────────────────────────────
+
+def comic_info_xml(series: str, title: str, number: int, page_count: int, web: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<ComicInfo>\n"
+        f"  <Series>{escape(series)}</Series>\n"
+        f"  <Title>{escape(title)}</Title>\n"
+        f"  <Number>{number}</Number>\n"
+        f"  <PageCount>{page_count}</PageCount>\n"
+        f"  <Web>{escape(web)}</Web>\n"
+        "</ComicInfo>\n"
+    )
+
+
+def write_cbz(path: str, pages: list, info_xml):
+    """
+    A CBZ is a ZIP of images. Images are already compressed, so ZIP_STORED
+    (no compression) is faster and the same size. Written to .part first
+    so a crash never leaves a half-finished file that looks complete.
+    """
+    tmp = path + ".part"
+    width = max(3, len(str(len(pages))))
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
+        for i, (data, ext) in enumerate(pages, start=1):
+            z.writestr(f"{i:0{width}d}.{ext}", data)
+        if info_xml:
+            z.writestr("ComicInfo.xml", info_xml)
+    os.replace(tmp, path)
+
+
+# ─────────────────────────────────────────────
+# One chapter: download -> convert -> pack  (runs in a background thread)
+# ─────────────────────────────────────────────
+
+def build_chapter(S, ep_num: int, title: str, url: str, srcs: list, out_path: str) -> tuple:
+    """Returns (ep_num, ok, message). Never raises."""
+    t0 = time.time()
+    try:
+        raw = [None] * len(srcs)
+        for _attempt in range(3):          # initial pass + 2 retries of failures
+            missing = [i for i, d in enumerate(raw) if d is None]
+            if not missing:
+                break
+            got = list(S.dl_pool.map(lambda i: fetch(S.session, srcs[i]), missing))
+            for i, d in zip(missing, got):
+                raw[i] = d
+
+        failed = sum(1 for d in raw if d is None)
+        if failed:
+            return ep_num, False, f"{failed}/{len(srcs)} pages failed to download (chapter not saved)"
+
+        orig_total = sum(len(d) for d in raw)
+        jobs = [(d, S.mode, S.quality, S.method, S.max_width) for d in raw]
+        del raw
+        if S.conv_pool:
+            pages = list(S.conv_pool.map(convert_page, jobs, chunksize=2))
         else:
-            self.status.set("Finished with problems. See the log.")
+            pages = [convert_page(j) for j in jobs]
+        del jobs
 
-    def on_close(self):
-        if self.running and not messagebox.askyesno(
-                "Download in progress",
-                "A download is still running. Close anyway?\n\n"
-                "Unfinished chapters are not saved and will be retried next time."):
-            return
-        self.root.destroy()
-        if self.running:
-            os._exit(0)
+        info = comic_info_xml(S.series, title, ep_num, len(pages), url) if S.comicinfo else None
+        write_cbz(out_path, pages, info)
+
+        if S.keep_images:
+            folder = out_path[:-4] + "_pages"
+            os.makedirs(folder, exist_ok=True)
+            width = max(3, len(str(len(pages))))
+            for i, (data, ext) in enumerate(pages, start=1):
+                with open(os.path.join(folder, f"{i:0{width}d}.{ext}"), "wb") as f:
+                    f.write(data)
+
+        new_total = os.path.getsize(out_path)
+        change = (new_total / orig_total - 1) * 100 if orig_total else 0
+        msg = (f"{len(pages)} pages, {human_size(orig_total)} -> {human_size(new_total)} "
+               f"({change:+.0f}%) in {time.time() - t0:.1f}s")
+        return ep_num, True, msg
+    except Exception as e:
+        return ep_num, False, f"{type(e).__name__}: {e}"
+
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
+
+def _on_chapter_done(slots, ep_num, fut):
+    slots.release()
+    _, ok, msg = fut.result()
+    print(f"   [{'done' if ok else 'FAIL'}] EP{ep_num}: {msg}")
 
 
 def main():
     try:
-        os.chdir(APP_DIR)       # relative save folders land next to the app
-    except OSError:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
         pass
-    if os.name == "nt":
+
+    app_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    config_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(app_dir, "config.yml")
+    cfg = load_config(config_path)
+
+    manga_url     = get(cfg, "manga",   "url")
+    chapter_start = get(cfg, "manga",   "chapter_start")
+    chapter_end   = get(cfg, "manga",   "chapter_end")
+    referer       = get(cfg, "manga",   "referer")
+    output_dir    = get(cfg, "output",  "dir",              default="manga_output")
+    keep_images   = get(cfg, "output",  "keep_images",      default=False)
+    comicinfo     = get(cfg, "output",  "comicinfo",        default=True)
+    image_format  = str(get(cfg, "output", "image_format",  default="webp")).lower()
+    # "jpeg_quality" is the old key name; still accepted.
+    quality       = int(get(cfg, "output", "quality",
+                            default=get(cfg, "output", "jpeg_quality", default=90)))
+    webp_method   = int(get(cfg, "output", "webp_method",   default=6))
+    max_width     = int(get(cfg, "output", "max_image_width", default=0))
+    headless      = get(cfg, "browser", "headless",         default=True)
+    BROWSER["kind"]   = str(get(cfg, "browser", "type", default="chrome")).lower()
+    BROWSER["binary"] = get(cfg, "browser", "binary_path")
+    BROWSER["driver"] = get(cfg, "browser", "driver_path")
+    restart_every = int(get(cfg, "browser", "restart_every", default=25))
+    block_images  = get(cfg, "browser", "block_images",     default=True)
+    dl_workers    = int(get(cfg, "speed", "download_workers", default=16))
+    conv_workers  = int(get(cfg, "speed", "convert_workers",  default=0))
+    priority      = str(get(cfg, "speed", "priority",         default="low")).lower()
+    chapter_par   = int(get(cfg, "speed", "parallel_chapters", default=3))
+    scroll_wait   = float(get(cfg, "speed", "scroll_wait",    default=0.4))
+    page_wait     = float(get(cfg, "speed", "page_wait",      default=3.0))
+    chapter_delay = float(get(cfg, "speed", "chapter_delay",  default=0.5))
+
+    if not manga_url or manga_url == "URL-HERE":
+        print("manga.url is not set in config.yml")
+        sys.exit(1)
+    if image_format not in IMAGE_MODES:
+        print(f"output.image_format must be one of {IMAGE_MODES}, got '{image_format}'")
+        sys.exit(1)
+    if BROWSER["kind"] not in ("chrome", "edge"):
+        print(f"browser.type must be 'chrome' or 'edge', got '{BROWSER['kind']}'")
+        sys.exit(1)
+    if priority not in PRIORITIES:
+        print(f"speed.priority must be one of {PRIORITIES}, got '{priority}'")
+        sys.exit(1)
+    if conv_workers <= 0:
+        conv_workers = max(1, (os.cpu_count() or 4) - 2)
+    needs_conversion = image_format != "original"
+
+    print(f"Pages: {image_format}"
+          + (f" (quality {quality})" if needs_conversion else " (untouched originals)")
+          + (f", max width {max_width}px" if needs_conversion and max_width else ""))
+    print(f"Downloads: {dl_workers} parallel | chapters in flight: {chapter_par}"
+          + (f" | convert processes: {conv_workers}" if needs_conversion else ""))
+
+    set_priority(priority)      # do this before any workers/Chrome are started
+    if priority != "normal":
+        print(f"CPU priority: {priority}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    for leftover in glob.glob(os.path.join(output_dir, "*.part")):
+        os.remove(leftover)             # unfinished files from a crashed run
+
+    S = SimpleNamespace(
+        session=make_session(manga_url, referer, dl_workers),
+        dl_pool=ThreadPoolExecutor(max_workers=dl_workers),
+        conv_pool=(ProcessPoolExecutor(max_workers=conv_workers, initializer=set_priority,
+                             initargs=(priority,)) if needs_conversion else None),
+        mode=image_format, quality=quality, method=webp_method, max_width=max_width,
+        comicinfo=comicinfo, keep_images=keep_images, series="Manhwa",
+    )
+    chapter_pool = ThreadPoolExecutor(max_workers=chapter_par)
+    slots = threading.BoundedSemaphore(chapter_par + 1)   # limits memory held in flight
+    futures = []
+    failed = []
+    t_start = time.time()
+
+    driver = make_driver(headless, block_images)
+    try:
+        chapters, S.series = get_chapter_links(driver, manga_url)
+        if not chapters:
+            return
+
+        start = int(chapter_start) if chapter_start is not None else 1
+        end   = int(chapter_end)   if chapter_end   is not None else len(chapters)
+        start = max(1, min(start, len(chapters)))
+        end   = max(1, min(end,   len(chapters)))
+        if start > end:
+            print(f"chapter_start ({start}) > chapter_end ({end}), nothing to do.")
+            return
+
+        selected = chapters[start - 1 : end]
+        pad = len(str(len(chapters)))
+        print(f"Downloading EP{start} to EP{end} ({len(selected)} chapters)")
+
+        scraped = 0
+        for ep_num, (url, title) in zip(range(start, end + 1), selected):
+            clean_title = safe_filename(title) if title else f"chapter-{ep_num}"
+            out_path = os.path.join(output_dir, f"EP{ep_num:0{pad}d}-{clean_title}.cbz")
+
+            if os.path.exists(out_path):
+                print(f"EP{ep_num} already exists, skipping.")
+                continue
+
+            print(f"EP{ep_num}/{len(chapters)} - {clean_title}: collecting pages...")
+            srcs = get_image_srcs(driver, url, page_wait, scroll_wait)
+
+            if not srcs and block_images:
+                # Some sites only reveal images once the browser loads them.
+                print("   No images found - retrying with browser images enabled")
+                driver.quit()
+                driver = make_driver(headless, False)
+                block_images = False
+                srcs = get_image_srcs(driver, url, page_wait, scroll_wait)
+
+            if not srcs:
+                print(f"   EP{ep_num}: no images found, skipping.")
+                failed.append(ep_num)
+                continue
+
+            # Hand the chapter to the background pipeline and move straight on.
+            slots.acquire()
+            fut = chapter_pool.submit(
+                build_chapter, S, ep_num, clean_title, url, srcs, out_path
+            )
+            fut.add_done_callback(
+                lambda f, _ep=ep_num: _on_chapter_done(slots, _ep, f)
+            )
+            futures.append((ep_num, fut))
+
+            driver.get("about:blank")
+            scraped += 1
+            if restart_every and scraped % restart_every == 0:
+                print(f"Restarting Chrome at EP{ep_num} to free memory...")
+                driver.quit()
+                driver = make_driver(headless, block_images)
+            time.sleep(chapter_delay)
+
+        print("\nWaiting for the last chapters to finish...")
+        failed += [ep for ep, fut in futures if not fut.result()[1]]
+
+    finally:
         try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)   # sharp text on HiDPI
+            driver.quit()
         except Exception:
             pass
-    root = tk.Tk()
-    root.title("Manga Downloader")
-    root.minsize(720, 720)
-    root.columnconfigure(0, weight=1)
-    root.rowconfigure(0, weight=1)
-    App(root).grid(row=0, column=0, sticky="nsew")
-    root.mainloop()
+        chapter_pool.shutdown(wait=True, cancel_futures=True)
+        S.dl_pool.shutdown(wait=True, cancel_futures=True)
+        if S.conv_pool:
+            S.conv_pool.shutdown(wait=True, cancel_futures=True)
+
+    elapsed = time.time() - t_start
+    print(f"\nAll done in {elapsed:.0f}s! CBZ files saved in: ./{output_dir}/")
+    if failed:
+        print("These chapters failed - run again to retry them: "
+              + ", ".join(f"EP{ep}" for ep in sorted(failed)))
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()    # needed for the converter processes in the exe
     main()
