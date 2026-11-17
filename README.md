@@ -1,9 +1,8 @@
 # Manhwa-Downloader
-just to use download some manhwa only work with manhwa website that allowed you to right click and download the picture of that manhwa.
-
+just to use download some manhwa only work for some website but mostly working.
 Each chapter is saved as a **CBZ** (a ZIP of page images) — smaller than PDF, keeps the original image quality, and opens in every comic reader (Komga, Kavita, Mihon, YACReader, CDisplayEx, ...).
 
-## Setup วิธีการติดตั้ง
+## Setup
 
 1. Install Python 3.10+ and Google Chrome
 2. Install dependencies:
@@ -13,7 +12,7 @@ Each chapter is saved as a **CBZ** (a ZIP of page images) — smaller than PDF, 
    ```
 3. Edit `config.yml` with your manga URL and chapter range
 
-## Usage วิธีการใช้งาน
+## Usage
 
 ```bash
 # Run with default config.yml
@@ -78,15 +77,15 @@ Download speed is limited by your internet connection and the site's server, not
 ## Chapter range examples
 
 ```yaml
-# Download everything โหลดทุกตอน
+# Download everything
 chapter_start: null
 chapter_end: null
 
-# EP62 to the end โหลดตอน X ถึงตอนล่าสุด
+# EP62 to the end
 chapter_start: 62
 chapter_end: null
 
-# EP10 to EP20 only โหลดเฉพาะตอน X ถึงตอน X
+# EP10 to EP20 only
 chapter_start: 10
 chapter_end: 20
 ```
