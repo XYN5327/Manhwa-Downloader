@@ -3,8 +3,12 @@ just to use download some manhwa only work for some website but mostly working.
 Each chapter is saved as a **CBZ** (a ZIP of page images) — smaller than PDF, keeps the original image quality, and opens in every comic reader (Komga, Kavita, Mihon, YACReader, CDisplayEx, ...).
 
 ## Setup
+1. Download manhwaDL.exe from release download
+2. Config and Put Urls
+3. Saved and download
 
-1. Install Python 3.10+ and Google Chrome
+## Setup for python version
+1. Install Python 3.10+ and Google Chrome (Or Edge can change in configs)
 2. Install dependencies:
    ```
    $env:PYYAML_FORCE_LIBYAML = "0"
