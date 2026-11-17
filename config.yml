@@ -56,7 +56,7 @@ output:
 browser:
   # Which browser to drive: "chrome" or "edge".
   # Windows already includes Microsoft Edge, so "edge" needs nothing installed.
-  type: chrome
+  type: edge
 
   # OPTIONAL: full path to the browser program, for portable/scoop installs.
   # null = auto-detect. Example (scoop Chromium):
