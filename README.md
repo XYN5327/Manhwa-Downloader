@@ -3,7 +3,7 @@ just to use download some manhwa only work for some website but mostly working.
 Each chapter is saved as a **CBZ** (a ZIP of page images) — smaller than PDF, keeps the original image quality, and opens in every comic reader (Komga, Kavita, Mihon, YACReader, CDisplayEx, ...).
 
 ## Setup
-1. Download manhwaDL.exe from release download
+1. Download ManhwaDL.exe from release download
 2. Config and Put Urls
 3. Saved and download
 
