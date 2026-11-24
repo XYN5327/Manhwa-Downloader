@@ -27,6 +27,17 @@ import manga
 
 APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 CONFIG_PATH = os.path.join(APP_DIR, "config.yml")
+ICON_NAME = "icon.ico"      # change this if your icon file has another name
+
+
+def find_icon():
+    """The icon is bundled inside the exe, so look next to this script first."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (here, APP_DIR, os.getcwd()):
+        path = os.path.join(base, ICON_NAME)
+        if os.path.isfile(path):
+            return path
+    return None
 
 # ─────────────────────────────────────────────
 # Field definitions: one row in the form each
@@ -48,16 +59,16 @@ FIELDS = [
 
     Field("output", "dir", "Save folder", "dir", None,
           "A relative folder is created next to the app.", "Manga-Download"),
-    Field("output", "image_format", "Image format", "choice",
+    Field("output", "image_format", "Pictures", "choice",
           ("webp", "original", "jpeg"),
-          "webp = smallest files. original = untouched pages. jpeg = for readers without WebP.",
+          "Raw saves pages exactly as the site serves them. Re-encode makes smaller files.",
           "webp"),
     Field("output", "quality", "Quality", "int", (1, 100),
-          "For webp and jpeg. 90 looks identical to the source; 75 is smallest.", 90),
+          "Only used when re-encoding. 90 looks identical to the source; 75 is smallest.", 90),
     Field("output", "webp_method", "WebP effort", "int", (0, 6),
-          "6 = smallest files but slowest. Lower it on a weak CPU.", 6),
+          "WebP only. 6 = smallest files but slowest. Lower it on a weak CPU.", 6),
     Field("output", "max_image_width", "Max page width (px)", "int", (0, 20000),
-          "0 = never resize. Resizing loses quality.", 0),
+          "Only used when re-encoding. 0 = never resize. Resizing loses quality.", 0),
     Field("output", "comicinfo", "Write ComicInfo.xml", "bool", None,
           "Series and chapter info for Komga, Kavita, Mihon and similar apps.", True),
     Field("output", "keep_images", "Keep page images", "bool", None,
@@ -95,6 +106,15 @@ FIELDS = [
 TABS = {"manga": "Manga", "output": "Output", "browser": "Browser", "speed": "Speed"}
 FIELD_BY_KEY = {(f.section, f.key): f for f in FIELDS}
 
+# Friendly names shown in the window; the config keeps the short value.
+CHOICE_LABELS = {
+    ("output", "image_format"): {
+        "original": "Raw: keep original pictures (biggest, no quality loss)",
+        "webp": "Re-encode to WebP (smallest files)",
+        "jpeg": "Re-encode to JPEG (works in every reader)",
+    },
+}
+
 
 # ─────────────────────────────────────────────
 # Reading values from the form / writing config.yml
@@ -113,6 +133,9 @@ def read_field(f: Field, raw):
             raise ValueError(f"{f.label} can't be empty.")
         return s
     if f.kind == "choice":
+        labels = CHOICE_LABELS.get((f.section, f.key))
+        if labels:
+            s = next((k for k, v in labels.items() if v == s), s)
         if s not in f.opts:
             raise ValueError(f"{f.label} must be one of: {', '.join(f.opts)}.")
         return s
@@ -213,6 +236,7 @@ class App(ttk.Frame):
         super().__init__(root, padding=12)
         self.root = root
         self.vars = {}
+        self.widgets = {}
         self.rows = {sec: 0 for sec in TABS}
         self.q = queue.Queue()
         self.running = False
@@ -283,8 +307,10 @@ class App(ttk.Frame):
             ttk.Label(fr, text=f.label).grid(
                 row=r, column=0, sticky="w", padx=(0, 14), pady=(10, 0))
             if f.kind == "choice":
-                w = ttk.Combobox(fr, textvariable=var, values=f.opts,
-                                 state="readonly", width=12)
+                labels = CHOICE_LABELS.get(key)
+                w = ttk.Combobox(fr, textvariable=var,
+                                 values=list(labels.values()) if labels else f.opts,
+                                 state="readonly", width=48 if labels else 12)
                 sticky = "w"
             elif f.kind in ("int", "float"):
                 step = 0.1 if f.kind == "float" else 1
@@ -304,6 +330,23 @@ class App(ttk.Frame):
             ttk.Label(fr, text=f.hint, style="Hint.TLabel", wraplength=520,
                       justify="left").grid(row=r + 1, column=1, columnspan=2, sticky="w")
         self.vars[key] = var
+        self.widgets[key] = w if f.kind != "bool" else None
+        if key == ("output", "image_format"):
+            var.trace_add("write", lambda *_: self.update_reencode_state())
+
+    def update_reencode_state(self):
+        """Grey out re-encode settings when pictures are kept raw."""
+        mode = read_field(FIELD_BY_KEY[("output", "image_format")],
+                          self.vars[("output", "image_format")].get()) \
+            if self.vars[("output", "image_format")].get() else "webp"
+        for key, active in (
+            (("output", "quality"), mode != "original"),
+            (("output", "max_image_width"), mode != "original"),
+            (("output", "webp_method"), mode == "webp"),
+        ):
+            w = self.widgets.get(key)
+            if w is not None:
+                w.configure(state="normal" if active else "disabled")
 
     def browse(self, f: Field, var: tk.StringVar):
         start = var.get() or APP_DIR
@@ -333,7 +376,11 @@ class App(ttk.Frame):
             if f.kind == "bool":
                 var.set(bool(val))
             else:
+                labels = CHOICE_LABELS.get((f.section, f.key))
+                if labels:
+                    val = labels.get(str(val).lower(), val)
                 var.set("" if val is None else str(val))
+        self.update_reencode_state()
         if str(self.vars[("manga", "url")].get()) == "URL-HERE":
             self.vars[("manga", "url")].set("")
 
@@ -479,8 +526,20 @@ def main():
             ctypes.windll.shcore.SetProcessDpiAwareness(1)   # sharp text on HiDPI
         except Exception:
             pass
+        try:
+            import ctypes
+            # Own taskbar identity, so Windows shows our icon and not Python's
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MangaDownloader.App")
+        except Exception:
+            pass
     root = tk.Tk()
     root.title("Manga Downloader")
+    icon = find_icon()
+    if icon:
+        try:
+            root.iconbitmap(default=icon)    # title bar, taskbar and dialogs
+        except Exception:
+            pass
     root.minsize(720, 720)
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
